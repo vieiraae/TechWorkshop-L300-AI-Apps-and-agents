@@ -4,6 +4,7 @@ with a persistent connection that is reused across tool calls.
 """
 import asyncio
 import logging
+import os
 import sys
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -38,6 +39,7 @@ class MCPShopperToolsClient:
         server_params = StdioServerParameters(
             command=sys.executable,
             args=[_SERVER_SCRIPT],
+            env=os.environ.copy(),
         )
 
         read, write = await self._exit_stack.enter_async_context(
