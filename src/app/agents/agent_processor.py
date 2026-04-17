@@ -18,6 +18,7 @@ from typing import List, Dict
 from openai.types.responses.response_input_param import FunctionCallOutput, ResponseInputParam
 import json
 import asyncio
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import time
 import logging
@@ -26,17 +27,12 @@ from app.agents.mcp_tools import MCP_FUNCTIONS
 from app.agents.tool_definitions import get_tools_for_agent
 
 from opentelemetry import trace
-from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.ai.agents.telemetry import trace_function
-# from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
 
-# Enable Azure Monitor tracing
-application_insights_connection_string = os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
-# configure_azure_monitor(connection_string=application_insights_connection_string)
-# OpenAIInstrumentor().instrument()
-
-# scenario = os.path.basename(__file__)
-# tracer = trace.get_tracer(__name__)
+# Tracing is configured once in chat_app.py (the application entry point).
+# Do NOT call configure_azure_monitor() or OpenAIInstrumentor().instrument()
+# here — duplicate calls corrupt the OpenTelemetry pipeline.
+tracer = trace.get_tracer(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -105,17 +101,24 @@ class AgentProcessor:
             if item.type != "function_call":
                 continue
 
-            handler = MCP_FUNCTIONS.get(item.name)
-            if handler:
-                func_result = await handler(**json.loads(item.arguments))
-            else:
-                func_result = {"error": f"Unknown function: {item.name}"}
+            with tracer.start_as_current_span(f"tool_call: {item.name}") as span:
+                span.set_attribute("tool.name", item.name)
+                span.set_attribute("tool.arguments", item.arguments)
 
-            logger.info(f"Function {item.name} returned: {func_result}")
+                handler = MCP_FUNCTIONS.get(item.name)
+                if handler:
+                    func_result = await handler(**json.loads(item.arguments))
+                else:
+                    func_result = {"error": f"Unknown function: {item.name}"}
+
+                output_str = json.dumps({"result": func_result})
+                span.set_attribute("tool.output", output_str[:4096])
+                logger.info(f"Function {item.name} returned: {func_result}")
+
             input_list.append(FunctionCallOutput(
                 type="function_call_output",
                 call_id=item.call_id,
-                output=json.dumps({"result": func_result})
+                output=output_str
             ))
         return input_list
 
@@ -124,57 +127,71 @@ class AgentProcessor:
         thread_id = self.thread_id
         start_time = time.time()
 
-        try:
-            openai_client = self.project_client.get_openai_client()
+        with tracer.start_as_current_span(f"agent_turn: {self.agent_type}") as span:
+            span.set_attribute("agent.type", self.agent_type)
+            span.set_attribute("agent.id", self.agent_id)
+            span.set_attribute("agent.input", input_message[:4096])
 
-            # Create or continue conversation thread
-            if thread_id:
-                openai_client.conversations.retrieve(conversation_id=thread_id)
-                openai_client.conversations.items.create(
-                    conversation_id=thread_id,
-                    items=[{"type": "message", "role": "user", "content": input_message}]
-                )
-            else:
-                conversation = openai_client.conversations.create(
-                    items=[{"role": "user", "content": input_message}]
-                )
-                thread_id = conversation.id
-                self.thread_id = thread_id
+            try:
+                openai_client = self.project_client.get_openai_client()
 
-            logger.info(f"[TIMELOG] Message creation took: {time.time() - start_time:.2f}s")
+                # Create or continue conversation thread
+                if thread_id:
+                    openai_client.conversations.retrieve(conversation_id=thread_id)
+                    openai_client.conversations.items.create(
+                        conversation_id=thread_id,
+                        items=[{"type": "message", "role": "user", "content": input_message}]
+                    )
+                else:
+                    conversation = openai_client.conversations.create(
+                        items=[{"role": "user", "content": input_message}]
+                    )
+                    thread_id = conversation.id
+                    self.thread_id = thread_id
 
-            # Get initial response (sync OpenAI call in thread pool)
-            loop = asyncio.get_event_loop()
-            message = await loop.run_in_executor(
-                _executor,
-                lambda: openai_client.responses.create(
-                    conversation=thread_id,
-                    extra_body={"agent_reference": {"name": self.agent_id, "type": "agent_reference"}},
-                    input="",
-                    stream=False
-                )
-            )
-            logger.info(f"[TIMELOG] Response retrieval took: {time.time() - start_time:.2f}s")
+                logger.info(f"[TIMELOG] Message creation took: {time.time() - start_time:.2f}s")
 
-            # If the agent wants to call functions, execute them and get a follow-up
-            if len(message.output_text) == 0:
-                logger.info("Agent requested function calls; dispatching to MCP tools")
-                input_list = await self._execute_function_calls(message)
-
+                # Get initial response (sync OpenAI call in thread pool)
+                # Copy context so OpenTelemetry spans propagate into the executor thread
+                loop = asyncio.get_event_loop()
+                ctx = contextvars.copy_context()
                 message = await loop.run_in_executor(
                     _executor,
-                    lambda: openai_client.responses.create(
-                        input=input_list,
-                        previous_response_id=message.id,
+                    lambda: ctx.run(
+                        openai_client.responses.create,
+                        conversation=thread_id,
                         extra_body={"agent_reference": {"name": self.agent_id, "type": "agent_reference"}},
+                        input="",
+                        stream=False,
                     )
                 )
+                logger.info(f"[TIMELOG] Response retrieval took: {time.time() - start_time:.2f}s")
 
-            return [self._extract_text(message)]
+                # If the agent wants to call functions, execute them and get a follow-up
+                if len(message.output_text) == 0:
+                    logger.info("Agent requested function calls; dispatching to MCP tools")
+                    input_list = await self._execute_function_calls(message)
 
-        except Exception as e:
-            logger.error(f"Conversation failed: {e}", exc_info=True)
-            return [f"Error processing message: {str(e)}"]
+                    ctx2 = contextvars.copy_context()
+                    message = await loop.run_in_executor(
+                        _executor,
+                        lambda: ctx2.run(
+                            openai_client.responses.create,
+                            input=input_list,
+                            previous_response_id=message.id,
+                            extra_body={"agent_reference": {"name": self.agent_id, "type": "agent_reference"}},
+                        )
+                    )
+
+                result_text = self._extract_text(message)
+                span.set_attribute("agent.output", result_text[:4096])
+                return [result_text]
+
+            except Exception as e:
+                logger.error(f"Conversation failed: {e}", exc_info=True)
+                span.set_attribute("error", True)
+                span.set_attribute("error.message", str(e))
+                return [f"Error processing message: {str(e)}"]
 
     async def run_conversation_with_text_stream(self, input_message: str = ""):
         """Async generator that yields text responses from the agent."""

@@ -10,6 +10,16 @@ import asyncio
 
 load_dotenv()
 
+from opentelemetry import trace
+from azure.monitor.opentelemetry import configure_azure_monitor
+from azure.ai.agents.telemetry import trace_function
+from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
+
+# Enable Azure Monitor tracing
+application_insights_connection_string = os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
+configure_azure_monitor(connection_string=application_insights_connection_string)
+OpenAIInstrumentor().instrument()
+
 IA_PROMPT_TARGET = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'prompts', 'InventoryAgentPrompt.txt')
 with open(IA_PROMPT_TARGET, 'r', encoding='utf-8') as file:
     IA_PROMPT = file.read()

@@ -1,0 +1,12 @@
+az acr build --registry yrloejegqzw6qcosureg --image chat-app:v4 --platform linux/amd64 --file Dockerfile .
+
+
+az containerapp registry set --name app-yrloejegqzw6q --resource-group rg-techworkshop --server yrloejegqzw6qcosureg.azurecr.io --identity system
+
+az containerapp update --name app-yrloejegqzw6q --resource-group rg-techworkshop --image yrloejegqzw6qcosureg.azurecr.io/chat-app:v4
+
+az containerapp update --name app-yrloejegqzw6q --resource-group rg-techworkshop --set-env-vars FOUNDRY_ENDPOINT="https://aif-yrloejegqzw6q.services.ai.azure.com/api/projects/proj-yrloejegqzw6q" gpt_endpoint="https://aif-yrloejegqzw6q.services.ai.azure.com" embedding_endpoint="https://aif-yrloejegqzw6q.services.ai.azure.com" phi_4_endpoint="https://aif-yrloejegqzw6q.services.ai.azure.com/models"
+
+
+az containerapp ingress update --name app-yrloejegqzw6q --resource-group rg-techworkshop --target-port 80
+
