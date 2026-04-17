@@ -1,0 +1,48 @@
+name: Deploy Interior Designer Agent
+
+on:
+  push:
+    paths:
+      - 'src/prompts/InteriorDesignAgentPrompt.txt'
+      - 'src/infra/agents/interior-designer.json'
+      - '.github/workflows/interior_designer_agent_update.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login via Azure CLI
+        uses: azure/login@v2.1.1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy interior-designer agent to Foundry
+        env:
+          FOUNDRY_ENDPOINT: ${{ secrets.FOUNDRY_ENDPOINT }}
+          GPT_DEPLOYMENT: ${{ secrets.GPT_DEPLOYMENT }}
+        run: |
+          # Read the prompt file and escape it for JSON
+          INSTRUCTIONS=$(python3 -c "
+          import json, sys
+          with open('src/prompts/InteriorDesignAgentPrompt.txt', 'r') as f:
+              print(json.dumps(f.read()))
+          ")
+
+          # Build the request body from the template, substituting variables
+          jq --arg model "$GPT_DEPLOYMENT" \
+             --argjson instructions "$INSTRUCTIONS" \
+             '.definition.model = $model | .definition.instructions = $instructions' \
+             src/infra/agents/interior-designer.json > /tmp/agent-payload.json
+
+          # Create/update the agent version via Foundry REST API
+          az rest --method POST \
+            --url "${FOUNDRY_ENDPOINT}/agents/interior-designer/versions?api-version=2025-11-15-preview" \
+            --headers "Content-Type=application/json" \
+            --resource "https://ai.azure.com" \
+            --body @/tmp/agent-payload.json
+
+          echo "Interior designer agent deployed successfully."
